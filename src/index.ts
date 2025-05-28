@@ -7,21 +7,16 @@ import { env } from './env';
 
 import { createQueue, setupQueueProcessor } from './queue';
 
-interface AddJobQueryString {
-  id: string;
-  email: string;
-}
-
 const run = async () => {
-  const welcomeEmailQueue = createQueue('WelcomeEmailQueue');
-  await setupQueueProcessor(welcomeEmailQueue.name);
+  const webhookQueue = createQueue('WebhookQueue');
+  await setupQueueProcessor(webhookQueue.name);
 
   const server: FastifyInstance<Server, IncomingMessage, ServerResponse> =
     fastify();
 
   const serverAdapter = new FastifyAdapter();
   createBullBoard({
-    queues: [new BullMQAdapter(welcomeEmailQueue)],
+    queues: [new BullMQAdapter(webhookQueue)],
     serverAdapter,
   });
   serverAdapter.setBasePath('/');
@@ -30,45 +25,62 @@ const run = async () => {
     basePath: '/',
   });
 
-  server.get(
-    '/add-job',
-    {
-      schema: {
-        querystring: {
-          type: 'object',
-          properties: {
-            title: { type: 'string' },
-            id: { type: 'string' },
-          },
-        },
-      },
-    },
-    (req: FastifyRequest<{ Querystring: AddJobQueryString }>, reply) => {
-      if (
-        req.query == null ||
-        req.query.email == null ||
-        req.query.id == null
-      ) {
-        reply
-          .status(400)
-          .send({ error: 'Requests must contain both an id and a email' });
+  // High priority webhook endpoint
+  server.post('/webhook/high-priority', async (req: FastifyRequest, reply) => {
+    try {
+      const webhookData = req.body;
 
-        return;
-      }
+      // Add job with high priority (100)
+      const job = await webhookQueue.add(
+        'webhook-high',
+        { data: webhookData },
+        { priority: 100 }
+      );
 
-      const { email, id } = req.query;
-      welcomeEmailQueue.add(`WelcomeEmail-${id}`, { email });
+      // Wait for job completion (max 2 minutes)
+      const result = await job.waitUntilFinished(undefined, 120000);
 
-      reply.send({
-        ok: true,
+      reply.send(result);
+    } catch (error) {
+      console.error('High priority webhook error:', error);
+      reply.status(500).send({
+        error: 'Failed to process webhook',
+        message: error instanceof Error ? error.message : 'Unknown error'
       });
     }
-  );
+  });
+
+  // Low priority webhook endpoint
+  server.post('/webhook/low-priority', async (req: FastifyRequest, reply) => {
+    try {
+      const webhookData = req.body;
+
+      // Add job with low priority (1)
+      const job = await webhookQueue.add(
+        'webhook-low',
+        { data: webhookData },
+        { priority: 1 }
+      );
+
+      // Wait for job completion (max 2 minutes)
+      const result = await job.waitUntilFinished(undefined, 120000);
+
+      reply.send(result);
+    } catch (error) {
+      console.error('Low priority webhook error:', error);
+      reply.status(500).send({
+        error: 'Failed to process webhook',
+        message: error instanceof Error ? error.message : 'Unknown error'
+      });
+    }
+  });
 
   await server.listen({ port: env.PORT, host: '0.0.0.0' });
-  console.log(
-    `To populate the queue and demo the UI, run: curl https://${env.RAILWAY_STATIC_URL}/add-job?id=1&email=hello%40world.com`
-  );
+  console.log(`Server running on port ${env.PORT}`);
+  console.log(`Webhook endpoints available:`);
+  console.log(`- High priority: https://${env.RAILWAY_STATIC_URL}/webhook/high-priority`);
+  console.log(`- Low priority: https://${env.RAILWAY_STATIC_URL}/webhook/low-priority`);
+  console.log(`- Dashboard: https://${env.RAILWAY_STATIC_URL}/`);
 };
 
 run().catch((e) => {
